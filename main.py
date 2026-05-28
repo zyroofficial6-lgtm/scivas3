@@ -1,7 +1,7 @@
 import httpx
 from bs4 import BeautifulSoup
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import zipfile
 import threading
@@ -67,6 +67,15 @@ AMBIL_FILE = "file/ambil_nomor.json"
 PREMIUM_COOKIE_FILE = "premium-cookie.json"
 LINK_OWNER = "t.me/kicenxensai"
 LINK_CHANNEL = "https://t.me/xorakuk"
+
+# ================= LOG & FORCE JOIN =================
+LOG_CHANNEL_ID = -1003908618331
+BOT_USERNAME   = ""   # diisi otomatis saat startup via getMe
+
+FORCE_JOIN_CHANNELS = [
+    {"username": "numberchshiro", "url": "https://t.me/numberchshiro", "label": "📢 Channel Info Update"},
+    {"username": "Ranzzz4",       "url": "https://t.me/Ranzzz4",       "label": "💬 Group Chat"},
+]
 
 # ================= PAKASIR PAYMENT =================
 PAKASIR_PROJECT = os.getenv("PAKASIR_PROJECT", "")
@@ -1026,6 +1035,32 @@ def payment_checker(user_id, chat_id, order_id, tier, days, amount, qr_msg_id):
                 f"📅 Aktif hingga: <b>{exp_str}</b>\n\n"
                 f"Selamat menggunakan bot IVAS! 🚀"
             )
+            # Kirim laporan pembelian ke channel log
+            def _purchase_log():
+                uname = BOT_USERNAME
+                now_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M")
+                udisp_buy = get_user_display(user_id)
+                msg_log = (
+                    f"💰 <b>PEMBELIAN BERHASIL</b>\n\n"
+                    f"<blockquote>"
+                    f"👤 User    : {udisp_buy}\n"
+                    f"🆔 ID      : <code>{user_id}</code>\n"
+                    f"📦 Paket   : {emoji} <b>{label}</b>\n"
+                    f"📅 Durasi  : <b>{days} hari</b>\n"
+                    f"💵 Nominal : <b>Rp {amount:,}</b>\n".replace(",", ".") +
+                    f"🕐 Waktu   : {now_str} WIB\n"
+                    f"🔖 Order   : <code>{order_id}</code>"
+                    f"</blockquote>"
+                )
+                markup = {"inline_keyboard": [[{"text": "🤖 Buka Bot", "url": f"https://t.me/{uname}"}]]} if uname else None
+                try:
+                    payload = {"chat_id": LOG_CHANNEL_ID, "text": msg_log, "parse_mode": "HTML"}
+                    if markup:
+                        payload["reply_markup"] = markup
+                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=10)
+                except Exception as le:
+                    print(f"PURCHASE LOG ERROR: {le}")
+            threading.Thread(target=_purchase_log, daemon=True).start()
             return
         elif status in ("expired", "cancelled"):
             pending_payments.pop(user_id, None)
@@ -1164,6 +1199,75 @@ def send_msg_return_id(chat_id, text):
 
 def send_msg(chat_id, text):
     _tg_request("sendMessage", data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+
+# ================= FORCE JOIN =================
+def check_force_join(user_id):
+    """Cek apakah user belum join channel/grup wajib. Return list yang belum."""
+    not_joined = []
+    for ch in FORCE_JOIN_CHANNELS:
+        try:
+            r = _tg_request("getChatMember", data={
+                "chat_id": f"@{ch['username']}",
+                "user_id": user_id
+            })
+            if r:
+                res = r.json()
+                if res.get("ok"):
+                    status = res["result"]["status"]
+                    if status in ("member", "administrator", "creator"):
+                        continue
+        except Exception:
+            pass
+        not_joined.append(ch)
+    return not_joined
+
+def send_force_join_msg(chat_id, not_joined):
+    """Kirim pesan wajib join dengan tombol URL (bukan link teks)."""
+    rows = [[{"text": ch["label"], "url": ch["url"]}] for ch in not_joined]
+    rows.append([{"text": "✅ Saya Sudah Join", "callback_data": "check_join"}])
+    keyboard = {"inline_keyboard": rows}
+    text = (
+        "🚫 <b>WAJIB JOIN DULU!</b>\n\n"
+        "<blockquote>Kamu belum join semua channel/grup yang diwajibkan.\n"
+        "Join dulu, lalu klik <b>✅ Saya Sudah Join</b>.</blockquote>"
+    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": keyboard},
+            timeout=10
+        )
+    except Exception as e:
+        print(f"FORCE JOIN MSG ERROR: {e}")
+
+# ================= ACTIVITY LOG =================
+def send_activity_log(user_id, username_display, feature_name, status="✅ Berhasil"):
+    """Kirim laporan aktivitas ke channel log secara async (tidak blocking)."""
+    def _send():
+        now_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M")
+        msg = (
+            f"📋 <b>LAPORAN AKTIVITAS</b>\n\n"
+            f"<blockquote>"
+            f"👤 User   : {username_display}\n"
+            f"🆔 ID     : <code>{user_id}</code>\n"
+            f"🔧 Fitur  : <b>{feature_name}</b>\n"
+            f"📊 Status : {status}\n"
+            f"🕐 Waktu  : {now_str} WIB"
+            f"</blockquote>"
+        )
+        uname = BOT_USERNAME
+        markup = {"inline_keyboard": [[{"text": "🤖 Buka Bot", "url": f"https://t.me/{uname}"}]]} if uname else None
+        try:
+            payload = {"chat_id": LOG_CHANNEL_ID, "text": msg, "parse_mode": "HTML"}
+            if markup:
+                payload["reply_markup"] = markup
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json=payload, timeout=10
+            )
+        except Exception as e:
+            print(f"ACTIVITY LOG ERROR: {e}")
+    threading.Thread(target=_send, daemon=True).start()
     
 def cek_premium(chat_id, user_id):
     my_groups = get_user_groups(user_id)
@@ -2693,7 +2797,16 @@ def listen_command():
                         cq_chat_id = cq["message"]["chat"]["id"]
                         cq_msg_id = cq["message"]["message_id"]
 
-                        if cq_data.startswith("setcookie:"):
+                        if cq_data == "check_join":
+                            not_joined = check_force_join(cq_user_id)
+                            if not_joined:
+                                answer_callback_query(cq_id, "⚠️ Kamu belum join semua channel/grup!")
+                                send_force_join_msg(cq_chat_id, not_joined)
+                            else:
+                                answer_callback_query(cq_id, "✅ Sudah join semua! Silakan gunakan bot.")
+                                delete_msg(cq_chat_id, cq_msg_id)
+                                handle_start(cq_user_id, cq_chat_id)
+                        elif cq_data.startswith("setcookie:"):
                             if is_owner(cq_user_id):
                                 handle_setcookie_callback(cq_chat_id, cq_user_id, cq_data[len("setcookie:"):], cq_id, cq_msg_id)
                             else:
@@ -2765,6 +2878,13 @@ def listen_command():
                     owner = is_owner(user_id)
                     is_group = msg["chat"]["type"] in ["group", "supergroup"]
 
+                    # ====== CEK WAJIB JOIN (hanya user non-owner di private chat) ======
+                    if not owner and not is_group and text.startswith("/") and text != "/start":
+                        not_joined = check_force_join(user_id)
+                        if not_joined:
+                            send_force_join_msg(chat_id, not_joined)
+                            continue
+
                     # ====== CEK PENDING SETCOOKIE (owner input cookie JSON) ======
                     if owner and user_id in pending_setcookie and text and not text.startswith("/"):
                         if process_cookie_input(chat_id, user_id, text):
@@ -2781,9 +2901,19 @@ def listen_command():
                             continue
 
                     # ROUTING COMMAND TEXT
-                    if text == "/start": handle_start(user_id, chat_id)
+                    udisp = get_user_display(user_id)
+
+                    if text == "/start":
+                        if not owner:
+                            not_joined = check_force_join(user_id)
+                            if not_joined:
+                                send_force_join_msg(chat_id, not_joined)
+                                continue
+                        handle_start(user_id, chat_id)
                     elif text.startswith("/cekivas"):
-                        if use_token(user_id): cek_ivas(chat_id)
+                        if use_token(user_id):
+                            cek_ivas(chat_id)
+                            send_activity_log(user_id, udisp, "/cekivas")
                         else: no_token_msg(chat_id)
                     elif text.startswith("/cekprem"): cek_premium(chat_id, user_id)
                     
@@ -2791,14 +2921,20 @@ def listen_command():
                         if owner: list_accounts(chat_id, user_id)
                         else: send_msg(chat_id, "  Khusus OWNER")
                     elif text.startswith("/addcookie"):
-                        if use_token(user_id): add_cookie_premium(text, chat_id, user_id)
+                        if use_token(user_id):
+                            add_cookie_premium(text, chat_id, user_id)
+                            send_activity_log(user_id, udisp, "/addcookie")
                         else: no_token_msg(chat_id)
                     elif text.startswith("/delcookie"):
-                        if use_token(user_id): del_cookie_premium(text, chat_id, user_id)
+                        if use_token(user_id):
+                            del_cookie_premium(text, chat_id, user_id)
+                            send_activity_log(user_id, udisp, "/delcookie")
                         else: no_token_msg(chat_id)
                     
                     elif text.startswith("/addemail"):
-                        if use_token(user_id): add_email(text, chat_id, user_id, msg_id)
+                        if use_token(user_id):
+                            add_email(text, chat_id, user_id, msg_id)
+                            send_activity_log(user_id, udisp, "/addemail")
                         else: no_token_msg(chat_id)
                     elif text.startswith("/listemail"): list_email(chat_id, user_id)
                     
@@ -2807,15 +2943,18 @@ def listen_command():
                             gid = str(chat_id)
                             if gid in get_user_groups(user_id):
                                 send_msg(chat_id, "  Grup sudah ada di akun kamu")
+                                send_activity_log(user_id, udisp, "/addgrup", "⚠️ Grup sudah ada")
                             else:
                                 add_user_group(user_id, gid)
                                 send_msg(chat_id, f"✅ <b>Grup berhasil ditambahkan!</b>\n\n<blockquote>🆔 ID: <code>{gid}</code>\n🔑 Key: <code>{get_or_create_user_key(user_id)}</code></blockquote>")
+                                send_activity_log(user_id, udisp, "/addgrup")
                         else: send_msg(chat_id, "  Jalankan di dalam grup!")
 
                     elif text.startswith("/delgrup"):
                         gid = str(chat_id)
                         if remove_user_group(user_id, gid):
                             send_msg(chat_id, f"  Grup dihapus dari akun kamu:\n{gid}")
+                            send_activity_log(user_id, udisp, "/delgrup")
                         else: send_msg(chat_id, "  Grup tidak ditemukan di akun kamu")
 
                     elif text.startswith("/listgrup"):
@@ -2827,23 +2966,32 @@ def listen_command():
                             send_msg(chat_id, msg_out)
 
                     elif text.startswith("/addnum"):
-                        if use_token(user_id): command_addnum(text, chat_id, user_id)
+                        if use_token(user_id):
+                            command_addnum(text, chat_id, user_id)
+                            send_activity_log(user_id, udisp, "/addnum")
                         else: no_token_msg(chat_id)
                         
                     elif text.startswith("/ambilfile"):
-                        if use_token(user_id): command_ambilfile(text, chat_id, user_id)
+                        if use_token(user_id):
+                            command_ambilfile(text, chat_id, user_id)
+                            send_activity_log(user_id, udisp, "/ambilfile")
                         else: no_token_msg(chat_id)
 
                     elif text.startswith("/delnumall"):
-                        if use_token(user_id): command_delnumall(text, chat_id, user_id)
+                        if use_token(user_id):
+                            command_delnumall(text, chat_id, user_id)
+                            send_activity_log(user_id, udisp, "/delnumall")
                         else: no_token_msg(chat_id)
 
                     elif text.startswith("/myrange"):
-                        if use_token(user_id): command_myrange(text, chat_id, user_id)
+                        if use_token(user_id):
+                            command_myrange(text, chat_id, user_id)
+                            send_activity_log(user_id, udisp, "/myrange")
                         else: no_token_msg(chat_id)
                     
                     elif text.startswith("/beli"):
                         cmd_beli(chat_id, user_id)
+                        send_activity_log(user_id, udisp, "/beli", "📦 Buka menu pembelian")
                     elif text.startswith("/addtoken"): 
                         if owner: add_token_tier(text, chat_id) 
                         else: send_msg(chat_id, "❌ Khusus OWNER")
@@ -3649,6 +3797,19 @@ signal.signal(signal.SIGTERM, _graceful_shutdown)
 signal.signal(signal.SIGINT,  _graceful_shutdown)
 
 # ================= START BOT =================
+# Ambil username bot via getMe untuk link tombol laporan
+def _init_bot_username():
+    global BOT_USERNAME
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10)
+        d = r.json()
+        if d.get("ok"):
+            BOT_USERNAME = d["result"].get("username", "")
+            print(Fore.CYAN + f"  BOT USERNAME: @{BOT_USERNAME}")
+    except Exception as e:
+        print(Fore.YELLOW + f"  getMe error: {e}")
+_init_bot_username()
+
 threading.Thread(target=run_keepalive,        daemon=True).start()
 threading.Thread(target=listen_command,       daemon=True).start()
 threading.Thread(target=auto_cookie_refresher,daemon=True).start()
