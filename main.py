@@ -58,7 +58,7 @@ RETURN_NUMBER_URL = f"{BASE}/portal/numbers/return/number"
 RETURN_ALL_URL = f"{BASE}/portal/numbers/return/allnumber/bluck"
 EXPORT_URL = f"{BASE}/portal/numbers/export"
 
-BOT_TOKEN = "8972596901:AAEZueI_bs2Z4CIfaTEhk01ibTj-wrOFcFE"
+BOT_TOKEN = "8134173482:AAGHVHETip-dzRTrbPwvpiYPqX89p3N7rSc"
 GROUPS_FILE = "groups.json"
 ADDNUM_API_URL = "https://ws.websocket.web.id/admin/addnumber"
 ADDNUM_API_KEY = "112231"
@@ -79,8 +79,8 @@ FORCE_JOIN_CHANNELS = [
 ]
 
 # ================= PAKASIR PAYMENT =================
-PAKASIR_PROJECT = os.getenv("PAKASIR_PROJECT", "")
-PAKASIR_API_KEY  = os.getenv("PAKASIR_API_KEY", "")
+PAKASIR_PROJECT = os.getenv("PAKASIR_PROJECT", "kifzl")
+PAKASIR_API_KEY  = os.getenv("PAKASIR_API_KEY", "pshebntafOuCoRpuQ5DBs2p9mML5cKU5")
 PAKASIR_BASE     = "https://app.pakasir.com"
 
 # Harga paket: {tier: {durasi_hari: harga_rupiah}}
