@@ -159,6 +159,8 @@ _session_fail_time   = {}   # email -> timestamp pertama kali gagal
 _session_notified    = {}   # email -> bool sudah notif atau belum
 _session_retry_time  = {}   # email -> timestamp terakhir retry
 _session_recovered   = {}   # email -> bool sudah notif recover
+# Rapid-fail protection: deteksi loop verify-OK → API-fail
+_api_fail_streak     = {}   # email -> {"count": N, "first": timestamp}
 
 # ================= AUTO COOKIE REFRESHER =================
 COOKIE_KEEPALIVE_INTERVAL = 600   # keepalive tiap 10 menit (sebelum session sempat expire)
@@ -189,6 +191,8 @@ _cache_dirty      = False
 _last_cache_save  = 0.0
 # Dibaca worker threads — diupdate oleh run_bot() manager thread
 _bot_state = {"email_to_uid": {}, "total_accounts": 0}
+# Flag untuk memaksa run_bot sync segera (set True setelah addcookie/setcookie berhasil)
+_force_bot_sync   = False
 
 # ================= ACCOUNT MANAGEMENT =================
 def load_accounts():
@@ -2125,16 +2129,32 @@ def parse_cookie_input(raw_text):
         return None
 
 def verify_cookie_session(acc):
+    """
+    Verifikasi session cookie.
+    Dinyatakan valid HANYA jika:
+    1. GET /portal tidak redirect ke /login
+    2. HTML portal berisi CSRF token (_token input)
+       — token ini WAJIB untuk semua POST API call
+    """
     try:
         session = acc["session"]
         r = session.get(f"{BASE}/portal", timeout=15)
         if "/login" in str(r.url):
             return False
         soup = BeautifulSoup(r.text, "html.parser")
+        # Cari _token dari <input> atau <meta>
         token_input = soup.find("input", {"name": "_token"})
         if token_input:
             acc["csrf_token"] = token_input["value"]
-        return True
+            return True
+        token_meta = soup.find("meta", {"name": "csrf-token"})
+        if token_meta:
+            acc["csrf_token"] = token_meta.get("content", "")
+            if acc["csrf_token"]:
+                return True
+        # Tidak ada CSRF token → halaman tidak ter-load sebagai user terautentikasi
+        print(f"  VERIFY: portal OK tapi no CSRF token — session dianggap expired")
+        return False
     except Exception as e:
         print(f"Cookie verify error: {e}")
         return False
@@ -2309,6 +2329,8 @@ def process_cookie_input(chat_id, user_id, text):
                     _session_fail_time.pop(email, None)
                     _session_retry_time.pop(email, None)
                     _session_recovered.pop(email, None)
+                    # Hapus ranges cache — paksa fetch fresh saat poll berikutnya
+                    _ranges_cache.pop(email, None)
                     delete_and_send(chat_id, proc_id,
                         f"🍪 <b>SET COOKIE — OWNER</b>\n\n"
                         f"✅ <b>Cookie berhasil disimpan &amp; langsung aktif!</b>\n\n"
@@ -2460,6 +2482,11 @@ def process_addcookie_input(chat_id, user_id, text):
             _session_fail_time.pop(email, None)
             _session_retry_time.pop(email, None)
             _session_recovered.pop(email, None)
+            # Hapus ranges cache — paksa fetch fresh saat poll berikutnya
+            _ranges_cache.pop(email, None)
+            # Paksa run_bot sync segera agar thread worker baru langsung spawn
+            global _force_bot_sync
+            _force_bot_sync = True
 
             delete_and_send(chat_id, proc_id,
                 f"🍪 <b>ADD COOKIE — TOKEN</b>\n\n"
@@ -2680,6 +2707,86 @@ def login(acc):
         print("  LOGIN GAGAL")
         return False
 
+def _is_login_page(r) -> bool:
+    """
+    Cek apakah response adalah halaman login (session expired/redirect).
+    Spesifik: harus punya form dengan FIELD email DAN password + keyword login.
+    Menghindari false-positive dari halaman portal yang punya password-change form.
+    """
+    try:
+        final_url = str(r.url)
+        if "/login" in final_url:
+            return True
+        if r.status_code in (401, 403):
+            return True
+        if r.status_code == 419:
+            return True
+        # Cek HTML marker halaman login — butuh BOTH email+password field + login keyword
+        snippet = r.text[:4000].lower()
+        has_password = 'type="password"' in snippet or "type='password'" in snippet
+        has_email    = 'type="email"' in snippet or 'name="email"' in snippet or "type='email'" in snippet
+        has_login_kw = "sign in" in snippet or "log in" in snippet or '"login"' in snippet or "'login'" in snippet or "masuk" in snippet
+        if has_password and has_email and has_login_kw:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _invalidate_session(acc, reason="SESSION_EXPIRED"):
+    """
+    Force re-login pada iterasi berikutnya & hapus cache ranges.
+    Rapid-fail protection: jika loop verify-OK→API-fail terjadi ≥2x dalam 120s,
+    tandai session mati dan gunakan SESSION_RETRY_INTERVAL agar tidak hammering server.
+    """
+    email = acc.get("email", "")
+    now   = time.time()
+    acc["last_login"] = 0
+    if email:
+        _ranges_cache.pop(email, None)
+
+        # Rapid-fail detection
+        streak = _api_fail_streak.get(email, {"count": 0, "first": 0})
+        if now - streak["first"] > 180:
+            # Reset streak jika sudah lama — anggap masalah baru
+            streak = {"count": 1, "first": now}
+        else:
+            streak = {"count": streak["count"] + 1, "first": streak["first"]}
+        _api_fail_streak[email] = streak
+
+        if streak["count"] >= 2:
+            # Verify OK tapi API terus fail → session benar-benar mati
+            print(f"  RAPID FAIL LOOP [{email}] ({streak['count']}x) — mark session expired, retry in {SESSION_RETRY_INTERVAL}s")
+            if not _session_notified.get(email):
+                _session_notified[email] = True
+                _session_recovered[email] = False
+                _session_fail_time[email] = streak["first"]
+                _session_retry_time[email] = now
+                # Notif ke pemilik akun
+                uid = _bot_state.get("email_to_uid", {}).get(email, OWNER_ID)
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        data={
+                            "chat_id": uid or OWNER_ID,
+                            "text": (
+                                f"⚠️ <b>SESSION EXPIRED</b>\n\n"
+                                f"📧 Email: <code>{email}</code>\n"
+                                f"❌ Cookie expired — API call gagal berulang kali.\n\n"
+                                f"Bot akan otomatis retry setiap 10 menit.\n"
+                                f"Perbarui cookie dengan /setcookie atau /addcookie."
+                            ),
+                            "parse_mode": "HTML"
+                        },
+                        timeout=10
+                    )
+                except Exception:
+                    pass
+            _api_fail_streak[email] = {"count": 0, "first": 0}  # Reset untuk siklus berikutnya
+
+    raise Exception(reason)
+
+
 def get_ranges(acc):
     today = datetime.now().strftime("%Y-%m-%d")
     r = acc["session"].post(GET_RANGE_URL, data={
@@ -2687,6 +2794,8 @@ def get_ranges(acc):
         "from": today,
         "to": today
     })
+    if _is_login_page(r):
+        _invalidate_session(acc, f"SESSION_EXPIRED: get_ranges redirect ke login ({r.url})")
     soup = BeautifulSoup(r.text, "html.parser")
     ranges = []
     for div in soup.find_all("div", onclick=True):
@@ -2699,6 +2808,7 @@ def get_ranges_cached(acc):
     """
     Wrapper get_ranges() dengan cache TTL 5 menit per akun.
     Mengurangi HTTP request ke IVAS ~95% saat tidak ada perubahan range.
+    Cache otomatis di-invalidate jika session expired terdeteksi.
     """
     email = acc.get("email", "")
     now   = time.time()
@@ -2707,7 +2817,7 @@ def get_ranges_cached(acc):
         ts, cached_ranges = entry
         if now - ts < RANGES_CACHE_TTL:
             return cached_ranges
-    ranges = get_ranges(acc)
+    ranges = get_ranges(acc)  # Akan raise jika session expired
     _ranges_cache[email] = (now, ranges)
     return ranges
 
@@ -2719,6 +2829,8 @@ def get_numbers(acc, rng):
         "end": today, 
         "range": rng
     })
+    if _is_login_page(r):
+        _invalidate_session(acc, f"SESSION_EXPIRED: get_numbers redirect ke login ({r.url})")
     soup = BeautifulSoup(r.text, "html.parser")
     numbers = []
     for div in soup.find_all("div", onclick=True):
@@ -2736,7 +2848,9 @@ def get_sms(acc, rng, number):
         "end": today,  
         "Number": number,  
         "Range": rng  
-    })  
+    })
+    if _is_login_page(r):
+        _invalidate_session(acc, f"SESSION_EXPIRED: get_sms redirect ke login ({r.url})")
     soup = BeautifulSoup(r.text, "html.parser")  
     sms_texts = []  
     try:  
@@ -3570,7 +3684,7 @@ def account_worker(acc):
 
 # ================= BOT MANAGER (state sync + thread manager) =================
 def run_bot():
-    global _premium_acc_cache, _cache_dirty, _last_cache_save
+    global _premium_acc_cache, _cache_dirty, _last_cache_save, _force_bot_sync
     _account_threads = {}   # email -> Thread
     _last_sync       = 0.0
 
@@ -3580,8 +3694,8 @@ def run_bot():
         try:
             now = time.time()
 
-            # ---- Sync state setiap 30 detik ----
-            if now - _last_sync >= 30:
+            # ---- Sync state setiap 30 detik ATAU saat _force_bot_sync=True ----
+            if now - _last_sync >= 30 or _force_bot_sync:
 
                 # Rebuild email → user_id mapping
                 new_email_to_uid = {}
@@ -3675,7 +3789,8 @@ def run_bot():
                 for em in [e for e in list(_account_threads) if e not in active_emails]:
                     del _account_threads[em]
 
-                _last_sync = now
+                _last_sync       = now
+                _force_bot_sync  = False  # Reset flag setelah sync selesai
 
             else:
                 # Health-check ringan setiap siklus (2 detik) — respawn thread mati
