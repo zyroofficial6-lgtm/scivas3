@@ -1,0 +1,42 @@
+{
+  "8317563450": {
+    "emails": [],
+    "key": "KX-DDBF-D1E3",
+    "tokens": 19,
+    "last_token_reset": "2026-05-28"
+  },
+  "8525009817": {
+    "emails": [],
+    "tokens": 20,
+    "last_token_reset": "2026-05-28"
+  },
+  "6493571970": {
+    "emails": [],
+    "tokens": 19,
+    "last_token_reset": "2026-05-28"
+  },
+  "8103364717": {
+    "emails": [],
+    "tokens": 20,
+    "last_token_reset": "2026-05-28"
+  },
+  "7439094850": {
+    "emails": [
+      "gafaka8849@web5h.com"
+    ],
+    "tokens": 16,
+    "last_token_reset": "2026-05-28",
+    "key": "KX-15BF-F16D",
+    "user_accounts": [
+      {
+        "email": "gafaka8849@web5h.com",
+        "password": "Levtzy12345"
+      }
+    ]
+  },
+  "6233768104": {
+    "emails": [],
+    "tokens": 19,
+    "last_token_reset": "2026-05-28"
+  }
+}
