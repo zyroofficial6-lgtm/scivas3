@@ -2564,8 +2564,6 @@ def ensure_login(acc):
     if now - acc.get("last_login", 0) < LOGIN_COOLDOWN:
         return True
 
-    print(f"  CEK SESSION : {email}")
-
     if acc.get("cookies"):
         if "session" not in acc or acc["session"] is None:
             acc["session"] = make_httpx_client()
@@ -2573,13 +2571,10 @@ def ensure_login(acc):
         acc["session"].cookies.update(acc["cookies"])
         if verify_cookie_session(acc):
             acc["last_login"] = now
-            print(f"  SESSION VIA COOKIE OK : {email}")
-            # Auto-save fresh cookies setelah verify berhasil
             fresh = extract_session_cookies(acc["session"])
             if fresh and fresh != acc.get("cookies"):
                 acc["cookies"] = fresh
                 save_fresh_cookies_auto(email, fresh)
-                print(f"  FRESH COOKIE AUTO-UPDATED: {email} ({len(fresh)} keys)")
             if _session_notified.get(email):
                 _session_notified[email] = False
                 _session_fail_time.pop(email, None)
@@ -2592,7 +2587,7 @@ def ensure_login(acc):
                         timeout=10
                     )
             return True
-        print(f"  COOKIE EXPIRED, COBA LOGIN PASSWORD : {email}")
+        print(Fore.YELLOW + f"  COOKIE EXPIRED [{email}] — coba login password")
 
     if login(acc):
         acc["last_login"] = now
@@ -2613,7 +2608,7 @@ def ensure_login(acc):
         _session_notified[email] = True
         _session_recovered[email] = False
         _session_fail_time[email] = now
-        print(f"  SESSION GAGAL, NOTIF OWNER : {email}")
+        print(Fore.RED + f"  SESSION GAGAL [{email}] — notif dikirim")
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={
@@ -3155,7 +3150,9 @@ def poll_one_account(acc):
     try:
         ranges = get_ranges_cached(acc)
     except Exception as e:
-        print(f"WARN get_ranges [{email}]: {e}")
+        err = str(e)
+        if "SESSION_EXPIRED" not in err:
+            print(Fore.YELLOW + f"  WARN get_ranges [{email}]: {err}")
         return False
 
     for rng in ranges:
@@ -3163,7 +3160,9 @@ def poll_one_account(acc):
         try:
             numbers = get_numbers(acc, rng)
         except Exception as e:
-            print(f"WARN get_numbers [{email}]: {e}")
+            err = str(e)
+            if "SESSION_EXPIRED" not in err:
+                print(Fore.YELLOW + f"  WARN get_numbers [{email}]: {err}")
             continue
 
         for num in numbers:
@@ -3296,7 +3295,7 @@ def auto_cookie_refresher():
             ]
 
             if due:
-                print(Fore.CYAN + f"  KEEPALIVE: ping {len(due)} akun...")
+                pass  # Silent ping — log hanya muncul jika ada error/warning
 
             for acc in due:
                 email = acc["email"]
