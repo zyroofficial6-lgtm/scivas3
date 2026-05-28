@@ -2899,22 +2899,9 @@ def poll_one_account(acc):
     owner_uid  = _bot_state["email_to_uid"].get(email, OWNER_ID)
     total      = _bot_state["total_accounts"]
 
-    # ── Tentukan tujuan kirim (grup atau private) per pihak ──────────────────
-    # Pihak 1: user pemilik akun (bisa == OWNER_ID untuk akun owner)
+    # ── Tentukan tujuan kirim: hanya ke pemilik akun (user/grup mereka sendiri) ──
     acct_groups  = get_user_groups(owner_uid)
-    user_targets = acct_groups if acct_groups else [str(owner_uid)]
-
-    # Pihak 2: owner bot (selalu ikut terima jika berbeda dengan user)
-    owner_grps        = get_user_groups(OWNER_ID)
-    bot_owner_targets = owner_grps if owner_grps else [str(OWNER_ID)]
-
-    # Gabungkan unik — hindari kirim 2x ke target yang sama
-    seen = set()
-    send_targets = []
-    for t in user_targets + bot_owner_targets:
-        if t not in seen:
-            seen.add(t)
-            send_targets.append(t)
+    send_targets = acct_groups if acct_groups else [str(owner_uid)]
 
     try:
         ranges = get_ranges_cached(acc)
@@ -2972,9 +2959,12 @@ def poll_one_account(acc):
                 )
 
                 for gid in send_targets:
-                    _tg_request("sendMessage",
+                    res = _tg_request("sendMessage",
                                 data={"chat_id": gid, "text": msg, "parse_mode": "HTML"},
                                 timeout=10)
+                    if res is not None and not res.json().get("ok"):
+                        err = res.json().get("description", "unknown error")
+                        print(Fore.RED + f"  SEND GAGAL → {gid}: {err}")
 
                 with _sent_cache_lock:
                     sent_cache.add(sms_uid)
@@ -2994,7 +2984,7 @@ def poll_one_account(acc):
 
 # ================= AUTO COOKIE REFRESHER =================
 def _notify_cookie_expired(email, uid):
-    """Kirim notif ke owner & user bahwa cookie expired — max 1x per COOKIE_NOTIF_COOLDOWN."""
+    """Kirim notif ke pemilik akun bahwa cookie expired — max 1x per COOKIE_NOTIF_COOLDOWN."""
     now = time.time()
     if now - _last_cookie_notif.get(email, 0) < COOKIE_NOTIF_COOLDOWN:
         return
@@ -3010,18 +3000,14 @@ def _notify_cookie_expired(email, uid):
         f"💡 Ambil cookie fresh dari browser:\n"
         f"DevTools → Application → Cookies → copy semua</blockquote>"
     )
+    # Kirim notif HANYA ke pemilik akun (bukan bocor ke owner kalau akun milik user)
+    target = uid if uid else OWNER_ID
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": OWNER_ID, "text": msg, "parse_mode": "HTML"},
+            data={"chat_id": target, "text": msg, "parse_mode": "HTML"},
             timeout=10
         )
-        if uid and uid != OWNER_ID:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                data={"chat_id": uid, "text": msg, "parse_mode": "HTML"},
-                timeout=10
-            )
     except Exception as e:
         print(Fore.RED + f"  NOTIF ERROR [{email}]: {e}")
 
@@ -3099,11 +3085,14 @@ def auto_cookie_refresher():
                                 _session_retry_time.pop(email, None)
                                 if not _session_recovered.get(email):
                                     _session_recovered[email] = True
+                                    # Kirim notif pulih hanya ke pemilik akun
+                                    _uid_recover = _bot_state.get("email_to_uid", {}).get(email, OWNER_ID)
+                                    recover_target = _uid_recover if _uid_recover else OWNER_ID
                                     try:
                                         requests.post(
                                             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                                             data={
-                                                "chat_id": OWNER_ID,
+                                                "chat_id": recover_target,
                                                 "text": (
                                                     f"✅ <b>SESSION PULIH</b>\n\n"
                                                     f"📧 Email: <code>{email}</code>\n"
@@ -3138,18 +3127,14 @@ def auto_cookie_refresher():
                                     f"• Owner: /setcookie\n"
                                     f"• User: /addcookie</blockquote>"
                                 )
+                                # Kirim HANYA ke pemilik akun (tidak bocor ke owner jika akun milik user)
+                                warn_target = uid if uid else OWNER_ID
                                 try:
                                     requests.post(
                                         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                                        data={"chat_id": OWNER_ID, "text": warn_msg, "parse_mode": "HTML"},
+                                        data={"chat_id": warn_target, "text": warn_msg, "parse_mode": "HTML"},
                                         timeout=10
                                     )
-                                    if uid and uid != OWNER_ID:
-                                        requests.post(
-                                            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                                            data={"chat_id": uid, "text": warn_msg, "parse_mode": "HTML"},
-                                            timeout=10
-                                        )
                                 except Exception:
                                     pass
                         else:
