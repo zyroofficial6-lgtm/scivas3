@@ -50,6 +50,7 @@ LANG_CODE_MAP = {
 OWNER_ID = 1611669051  # ID OWNER 
 BASE = "https://ivaskicen2.serverkicen.biz.id"
 LOGIN_URL = f"{BASE}/login"
+RECV_URL  = f"{BASE}/portal/sms/received"          # Sumber recv_csrf (per-page CSRF iVAS)
 GET_RANGE_URL = f"{BASE}/portal/sms/received/getsms"
 GET_NUMBER_URL = f"{BASE}/portal/sms/received/getsms/number"
 GET_SMS_URL = f"{BASE}/portal/sms/received/getsms/number/sms"
@@ -159,8 +160,6 @@ _session_fail_time   = {}   # email -> timestamp pertama kali gagal
 _session_notified    = {}   # email -> bool sudah notif atau belum
 _session_retry_time  = {}   # email -> timestamp terakhir retry
 _session_recovered   = {}   # email -> bool sudah notif recover
-# Rapid-fail protection: deteksi loop verify-OK → API-fail
-_api_fail_streak     = {}   # email -> {"count": N, "first": timestamp}
 
 # ================= AUTO COOKIE REFRESHER =================
 COOKIE_KEEPALIVE_INTERVAL = 600   # keepalive tiap 10 menit (sebelum session sempat expire)
@@ -172,6 +171,12 @@ _keepalive_warn_count     = {}    # email -> jumlah gagal keepalive berturut-tur
 # ================= RANGES CACHE (kurangi beban IVAS server) =================
 _ranges_cache    = {}   # email -> (timestamp, ranges_list)
 RANGES_CACHE_TTL = 300  # 5 menit — ranges jarang berubah
+
+# ================= RECV CSRF CACHE =================
+# iVAS pakai per-page CSRF — /portal/sms/received punya token berbeda dari /portal
+# Semua POST ke getsms, getsms/number, getsms/number/sms WAJIB pakai recv_csrf ini
+_recv_csrf_cache = {}   # email -> {"csrf": str, "ts": float}
+RECV_CSRF_TTL    = 900  # 15 menit — refresh sebelum expired
 
 # ================= AUTO BACKUP =================
 # Direktori & pola yang TIDAK perlu dibackup (sistem/cache/package)
@@ -2128,13 +2133,49 @@ def parse_cookie_input(raw_text):
     except:
         return None
 
+def get_recv_csrf(acc) -> str:
+    """
+    Ambil CSRF token dari halaman /portal/sms/received.
+    iVAS pakai per-page rotating CSRF — semua POST ke getsms API
+    WAJIB pakai token dari halaman ini, bukan dari /portal umum.
+    Di-cache 15 menit per akun.
+    """
+    email = acc.get("email", "")
+    now   = time.time()
+    cached = _recv_csrf_cache.get(email)
+    if cached and (now - cached["ts"]) < RECV_CSRF_TTL:
+        return cached["csrf"]
+    try:
+        r = acc["session"].get(RECV_URL, timeout=15)
+        if "/login" in str(r.url):
+            return acc.get("recv_csrf") or acc.get("csrf_token", "")
+        soup = BeautifulSoup(r.text, "html.parser")
+        csrf = ""
+        meta = soup.find("meta", {"name": "csrf-token"})
+        if meta:
+            csrf = meta.get("content", "")
+        if not csrf:
+            inp = soup.find("input", {"name": "_token"})
+            if inp:
+                csrf = inp.get("value", "")
+        if not csrf:
+            m = re.search(r"['\"]_token['\"]\s*[,:]?\s*['\"]([A-Za-z0-9_\-+/=]{20,})['\"]", r.text)
+            if m:
+                csrf = m.group(1)
+        if csrf:
+            acc["recv_csrf"] = csrf
+            _recv_csrf_cache[email] = {"csrf": csrf, "ts": now}
+            return csrf
+    except Exception as e:
+        print(f"WARN get_recv_csrf [{email}]: {e}")
+    return acc.get("recv_csrf") or acc.get("csrf_token", "")
+
+
 def verify_cookie_session(acc):
     """
     Verifikasi session cookie.
-    Dinyatakan valid HANYA jika:
-    1. GET /portal tidak redirect ke /login
-    2. HTML portal berisi CSRF token (_token input)
-       — token ini WAJIB untuk semua POST API call
+    1. GET /portal — cek tidak redirect ke /login & ambil csrf_token umum
+    2. GET /portal/sms/received — ambil recv_csrf khusus untuk SMS API
     """
     try:
         session = acc["session"]
@@ -2142,19 +2183,18 @@ def verify_cookie_session(acc):
         if "/login" in str(r.url):
             return False
         soup = BeautifulSoup(r.text, "html.parser")
-        # Cari _token dari <input> atau <meta>
         token_input = soup.find("input", {"name": "_token"})
         if token_input:
             acc["csrf_token"] = token_input["value"]
-            return True
-        token_meta = soup.find("meta", {"name": "csrf-token"})
-        if token_meta:
-            acc["csrf_token"] = token_meta.get("content", "")
-            if acc["csrf_token"]:
-                return True
-        # Tidak ada CSRF token → halaman tidak ter-load sebagai user terautentikasi
-        print(f"  VERIFY: portal OK tapi no CSRF token — session dianggap expired")
-        return False
+        else:
+            token_meta = soup.find("meta", {"name": "csrf-token"})
+            if token_meta:
+                acc["csrf_token"] = token_meta.get("content", "")
+        # Ambil recv_csrf — WAJIB untuk POST ke SMS API
+        email = acc.get("email", "")
+        _recv_csrf_cache.pop(email, None)  # Paksa refresh recv_csrf setelah verify
+        get_recv_csrf(acc)
+        return True
     except Exception as e:
         print(f"Cookie verify error: {e}")
         return False
@@ -2708,25 +2748,11 @@ def login(acc):
         return False
 
 def _is_login_page(r) -> bool:
-    """
-    Cek apakah response adalah halaman login (session expired/redirect).
-    Spesifik: harus punya form dengan FIELD email DAN password + keyword login.
-    Menghindari false-positive dari halaman portal yang punya password-change form.
-    """
+    """Cek apakah response adalah redirect ke halaman login (session expired)."""
     try:
-        final_url = str(r.url)
-        if "/login" in final_url:
+        if "/login" in str(r.url):
             return True
-        if r.status_code in (401, 403):
-            return True
-        if r.status_code == 419:
-            return True
-        # Cek HTML marker halaman login — butuh BOTH email+password field + login keyword
-        snippet = r.text[:4000].lower()
-        has_password = 'type="password"' in snippet or "type='password'" in snippet
-        has_email    = 'type="email"' in snippet or 'name="email"' in snippet or "type='email'" in snippet
-        has_login_kw = "sign in" in snippet or "log in" in snippet or '"login"' in snippet or "'login'" in snippet or "masuk" in snippet
-        if has_password and has_email and has_login_kw:
+        if r.status_code in (401, 403, 419):
             return True
     except Exception:
         pass
@@ -2735,67 +2761,35 @@ def _is_login_page(r) -> bool:
 
 def _invalidate_session(acc, reason="SESSION_EXPIRED"):
     """
-    Force re-login pada iterasi berikutnya & hapus cache ranges.
-    Rapid-fail protection: jika loop verify-OK→API-fail terjadi ≥2x dalam 120s,
-    tandai session mati dan gunakan SESSION_RETRY_INTERVAL agar tidak hammering server.
+    Force re-verify session pada iterasi berikutnya.
+    Hapus ranges cache & recv_csrf cache agar semua di-fetch ulang setelah re-login.
     """
     email = acc.get("email", "")
-    now   = time.time()
     acc["last_login"] = 0
     if email:
         _ranges_cache.pop(email, None)
-
-        # Rapid-fail detection
-        streak = _api_fail_streak.get(email, {"count": 0, "first": 0})
-        if now - streak["first"] > 180:
-            # Reset streak jika sudah lama — anggap masalah baru
-            streak = {"count": 1, "first": now}
-        else:
-            streak = {"count": streak["count"] + 1, "first": streak["first"]}
-        _api_fail_streak[email] = streak
-
-        if streak["count"] >= 2:
-            # Verify OK tapi API terus fail → session benar-benar mati
-            print(f"  RAPID FAIL LOOP [{email}] ({streak['count']}x) — mark session expired, retry in {SESSION_RETRY_INTERVAL}s")
-            if not _session_notified.get(email):
-                _session_notified[email] = True
-                _session_recovered[email] = False
-                _session_fail_time[email] = streak["first"]
-                _session_retry_time[email] = now
-                # Notif ke pemilik akun
-                uid = _bot_state.get("email_to_uid", {}).get(email, OWNER_ID)
-                try:
-                    requests.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        data={
-                            "chat_id": uid or OWNER_ID,
-                            "text": (
-                                f"⚠️ <b>SESSION EXPIRED</b>\n\n"
-                                f"📧 Email: <code>{email}</code>\n"
-                                f"❌ Cookie expired — API call gagal berulang kali.\n\n"
-                                f"Bot akan otomatis retry setiap 10 menit.\n"
-                                f"Perbarui cookie dengan /setcookie atau /addcookie."
-                            ),
-                            "parse_mode": "HTML"
-                        },
-                        timeout=10
-                    )
-                except Exception:
-                    pass
-            _api_fail_streak[email] = {"count": 0, "first": 0}  # Reset untuk siklus berikutnya
-
+        _recv_csrf_cache.pop(email, None)
     raise Exception(reason)
+
+
+_RECV_POST_HEADERS = {
+    "Accept":           "text/html,*/*;q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
+    "Referer":          RECV_URL,  # WAJIB — iVAS CSRF middleware cek Referer
+    "Origin":           BASE,
+}
 
 
 def get_ranges(acc):
     today = datetime.now().strftime("%Y-%m-%d")
-    r = acc["session"].post(GET_RANGE_URL, data={
-        "_token": acc.get("csrf_token", ""),
-        "from": today,
-        "to": today
-    })
+    csrf  = get_recv_csrf(acc)
+    r = acc["session"].post(GET_RANGE_URL,
+        data={"_token": csrf, "from": today, "to": today},
+        headers=_RECV_POST_HEADERS
+    )
     if _is_login_page(r):
-        _invalidate_session(acc, f"SESSION_EXPIRED: get_ranges redirect ke login ({r.url})")
+        _invalidate_session(acc, f"SESSION_EXPIRED: get_ranges ({r.url})")
     soup = BeautifulSoup(r.text, "html.parser")
     ranges = []
     for div in soup.find_all("div", onclick=True):
@@ -2805,11 +2799,7 @@ def get_ranges(acc):
     return list(set(ranges))
 
 def get_ranges_cached(acc):
-    """
-    Wrapper get_ranges() dengan cache TTL 5 menit per akun.
-    Mengurangi HTTP request ke IVAS ~95% saat tidak ada perubahan range.
-    Cache otomatis di-invalidate jika session expired terdeteksi.
-    """
+    """Cache ranges 5 menit. Auto-invalidate saat session expired."""
     email = acc.get("email", "")
     now   = time.time()
     entry = _ranges_cache.get(email)
@@ -2817,20 +2807,19 @@ def get_ranges_cached(acc):
         ts, cached_ranges = entry
         if now - ts < RANGES_CACHE_TTL:
             return cached_ranges
-    ranges = get_ranges(acc)  # Akan raise jika session expired
+    ranges = get_ranges(acc)
     _ranges_cache[email] = (now, ranges)
     return ranges
 
 def get_numbers(acc, rng):
     today = datetime.now().strftime("%Y-%m-%d")
-    r = acc["session"].post(GET_NUMBER_URL, data={
-        "_token": acc.get("csrf_token", ""),
-        "start": today, 
-        "end": today, 
-        "range": rng
-    })
+    csrf  = get_recv_csrf(acc)
+    r = acc["session"].post(GET_NUMBER_URL,
+        data={"_token": csrf, "start": today, "end": today, "range": rng},
+        headers=_RECV_POST_HEADERS
+    )
     if _is_login_page(r):
-        _invalidate_session(acc, f"SESSION_EXPIRED: get_numbers redirect ke login ({r.url})")
+        _invalidate_session(acc, f"SESSION_EXPIRED: get_numbers ({r.url})")
     soup = BeautifulSoup(r.text, "html.parser")
     numbers = []
     for div in soup.find_all("div", onclick=True):
@@ -2841,16 +2830,14 @@ def get_numbers(acc, rng):
     return list(set(numbers))
 
 def get_sms(acc, rng, number):  
-    today = datetime.now().strftime("%Y-%m-%d")  
-    r = acc["session"].post(GET_SMS_URL, data={  
-        "_token": acc.get("csrf_token", ""),
-        "start": today,  
-        "end": today,  
-        "Number": number,  
-        "Range": rng  
-    })
+    today = datetime.now().strftime("%Y-%m-%d")
+    csrf  = get_recv_csrf(acc)
+    r = acc["session"].post(GET_SMS_URL,
+        data={"_token": csrf, "start": today, "end": today, "Number": number, "Range": rng},
+        headers=_RECV_POST_HEADERS
+    )
     if _is_login_page(r):
-        _invalidate_session(acc, f"SESSION_EXPIRED: get_sms redirect ke login ({r.url})")
+        _invalidate_session(acc, f"SESSION_EXPIRED: get_sms ({r.url})")
     soup = BeautifulSoup(r.text, "html.parser")  
     sms_texts = []  
     try:  
@@ -3340,6 +3327,9 @@ def auto_cookie_refresher():
                             acc["cookies"] = fresh
                             acc["last_login"] = now
                             save_fresh_cookies_auto(email, fresh)
+                            # Refresh recv_csrf — hapus cache lama agar GET /portal/sms/received dipanggil ulang
+                            _recv_csrf_cache.pop(email, None)
+                            get_recv_csrf(acc)
                             # Reset flag session gagal jika sebelumnya sempat error
                             if _session_notified.get(email):
                                 _session_notified[email] = False
@@ -3347,7 +3337,6 @@ def auto_cookie_refresher():
                                 _session_retry_time.pop(email, None)
                                 if not _session_recovered.get(email):
                                     _session_recovered[email] = True
-                                    # Kirim notif pulih hanya ke pemilik akun
                                     _uid_recover = _bot_state.get("email_to_uid", {}).get(email, OWNER_ID)
                                     recover_target = _uid_recover if _uid_recover else OWNER_ID
                                     try:
@@ -3366,7 +3355,7 @@ def auto_cookie_refresher():
                                         )
                                     except Exception:
                                         pass
-                            _keepalive_warn_count[email] = 0  # reset counter saat berhasil
+                            _keepalive_warn_count[email] = 0
                             print(Fore.GREEN + f"  KEEPALIVE OK: {email} — {len(fresh)} cookie di-extend")
                     else:
                         # Hitung berapa kali keepalive gagal berturut-turut
